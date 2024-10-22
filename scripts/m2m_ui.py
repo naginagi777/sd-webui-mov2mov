@@ -1,104 +1,228 @@
+import importlib
 import os
+import platform
 import shutil
+import subprocess as sp
 import sys
 
 import gradio as gr
-import platform
+
+import modules
 import modules.scripts as scripts
-from modules import script_callbacks, shared, ui_postprocessing, call_queue
+from modules import (
+    script_callbacks,
+    shared,
+    call_queue,
+    sd_samplers,
+    ui_prompt_styles,
+    sd_models,
+)
 from modules.call_queue import wrap_gradio_gpu_call
-from modules.sd_samplers import visible_sampler_names
+from modules.images import image_data
 from modules.shared import opts
-from modules.ui import paste_symbol, clear_prompt_symbol, extra_networks_symbol, apply_style_symbol, save_style_symbol, \
-    create_refresh_button, create_sampler_and_steps_selection, ordered_ui_categories, switch_values_symbol, \
-    create_override_settings_dropdown
-from modules.ui_common import folder_symbol, plaintext_to_html
-from modules.ui_components import ToolButton, FormRow, FormGroup
-import modules.generation_parameters_copypaste as parameters_copypaste
-import subprocess as sp
+from modules.ui import (
+    ordered_ui_categories,
+    create_sampler_and_steps_selection,
+    switch_values_symbol,
+    create_override_settings_dropdown,
+    detect_image_size_symbol,
+    plaintext_to_html,
+    paste_symbol,
+    clear_prompt_symbol,
+    restore_progress_symbol,
+)
+from modules.ui_common import (
+    folder_symbol,
+    update_generation_info,
+    create_refresh_button,
+)
+from modules.ui_components import (
+    ResizeHandleRow,
+    FormRow,
+    ToolButton,
+    FormGroup,
+    InputAccordion,
+)
+from scripts import m2m_hook as patches
+from scripts import m2m_util
 from scripts import mov2mov
+from scripts.mov2mov import scripts_mov2mov
 from scripts.m2m_config import mov2mov_outpath_samples, mov2mov_output_dir
-from scripts.m2m_modnet import modnet_models
+from scripts.movie_editor import MovieEditor
 
-html_id = "mov2mov"
-
-
-def create_toprow():
-    with gr.Row(elem_id=f"{html_id}_toprow", variant="compact"):
-        with gr.Column(elem_id=f"{html_id}_prompt_container", scale=6):
-            with gr.Row():
-                with gr.Column(scale=80):
-                    with gr.Row():
-                        prompt = gr.Textbox(label="Prompt", elem_id=f"{html_id}_prompt", show_label=False, lines=3,
-                                            placeholder="Prompt (press Ctrl+Enter or Alt+Enter to generate)")
-
-            with gr.Row():
-                with gr.Column(scale=80):
-                    with gr.Row():
-                        negative_prompt = gr.Textbox(label="Negative prompt", elem_id=f"{html_id}_neg_prompt",
-                                                     show_label=False, lines=2,
-                                                     placeholder="Negative prompt (press Ctrl+Enter or Alt+Enter to generate)")
-
-        with gr.Column(scale=1, elem_id=f"{html_id}_actions_column"):
-            with gr.Row(elem_id=f"{html_id}_generate_box"):
-                interrupt = gr.Button('Interrupt', elem_id=f"{html_id}_interrupt")
-                skip = gr.Button('Skip', elem_id=f"{html_id}_skip")
-                submit = gr.Button('Generate', elem_id=f"{html_id}_generate", variant='primary')
-
-                # add copy from txt2img img2img
-
-                skip.click(
-                    fn=lambda: shared.state.skip(),
-                    inputs=[],
-                    outputs=[],
-                )
-
-                interrupt.click(
-                    fn=lambda: shared.state.interrupt(),
-                    inputs=[],
-                    outputs=[],
-                )
-
-            # with gr.Row(elem_id=f'{html_id}_copy'):
-            #     copy_from_txt2img = gr.Button('copy from txt2img', elem_id=f"{html_id}_copy_from_txt2img",
-            #                                   variant='secondary')
-            #
-            #     copy_from_img2img = gr.Button('copy from img2img', elem_id=f"{html_id}_copy_from_img2img",
-            #                                   variant='secondary')
-            #
-            #     copy_from_txt2img.click(None, [], [], _js="() => {return copy_from('txt2img')}")
-            #
-            #     copy_from_img2img.click(None, [], [], _js="() => {return copy_from('img2img')}")
-
-    return prompt, negative_prompt, submit
+id_part = "mov2mov"
 
 
 def save_video(video):
-    path = 'logs/movies'
+    path = "logs/movies"
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
-    index = len([path for path in os.listdir(path) if path.endswith('.mp4')]) + 1
-    video_path = os.path.join(path, str(index).zfill(5) + '.mp4')
+    index = len([path for path in os.listdir(path) if path.endswith(".mp4")]) + 1
+    video_path = os.path.join(path, str(index).zfill(5) + ".mp4")
     shutil.copyfile(video, video_path)
     filename = os.path.relpath(video_path, path)
-    return gr.File.update(value=video_path, visible=True), plaintext_to_html(f"Saved: {filename}")
+    return gr.File.update(value=video_path, visible=True), plaintext_to_html(
+        f"Saved: {filename}"
+    )
+
+
+class Toprow:
+    """Creates a top row UI with prompts, generate button, styles, extra little buttons for things, and enables some functionality related to their operation"""
+
+    def __init__(self, is_img2img, id_part=None):
+        if not id_part:
+            id_part = "img2img" if is_img2img else "txt2img"
+        self.id_part = id_part
+
+        with gr.Row(elem_id=f"{id_part}_toprow", variant="compact"):
+            with gr.Column(elem_id=f"{id_part}_prompt_container", scale=6):
+                with gr.Row():
+                    with gr.Column(scale=80):
+                        with gr.Row():
+                            self.prompt = gr.Textbox(
+                                label="Prompt",
+                                elem_id=f"{id_part}_prompt",
+                                show_label=False,
+                                lines=3,
+                                placeholder="Prompt (press Ctrl+Enter or Alt+Enter to generate)",
+                                elem_classes=["prompt"],
+                            )
+                            self.prompt_img = gr.File(
+                                label="",
+                                elem_id=f"{id_part}_prompt_image",
+                                file_count="single",
+                                type="binary",
+                                visible=False,
+                            )
+
+                with gr.Row():
+                    with gr.Column(scale=80):
+                        with gr.Row():
+                            self.negative_prompt = gr.Textbox(
+                                label="Negative prompt",
+                                elem_id=f"{id_part}_neg_prompt",
+                                show_label=False,
+                                lines=3,
+                                placeholder="Negative prompt (press Ctrl+Enter or Alt+Enter to generate)",
+                                elem_classes=["prompt"],
+                            )
+
+            self.button_interrogate = None
+            self.button_deepbooru = None
+            if is_img2img:
+                with gr.Column(scale=1, elem_classes="interrogate-col"):
+                    self.button_interrogate = gr.Button(
+                        "Interrogate\nCLIP", elem_id="interrogate"
+                    )
+                    self.button_deepbooru = gr.Button(
+                        "Interrogate\nDeepBooru", elem_id="deepbooru"
+                    )
+
+            with gr.Column(scale=1, elem_id=f"{id_part}_actions_column"):
+                with gr.Row(
+                    elem_id=f"{id_part}_generate_box", elem_classes="generate-box"
+                ):
+                    self.interrupt = gr.Button(
+                        "Interrupt",
+                        elem_id=f"{id_part}_interrupt",
+                        elem_classes="generate-box-interrupt",
+                    )
+                    self.interrupting = gr.Button(
+                        "Interrupting",
+                        elem_id=f"{id_part}_interrupting",
+                        elem_classes="generate-box-interrupt",
+                    )
+                    self.skip = gr.Button(
+                        "Skip",
+                        elem_id=f"{id_part}_skip",
+                        elem_classes="generate-box-skip",
+                    )
+                    self.skip = gr.Button(
+                        "Skip",
+                        elem_id=f"{id_part}_skip",
+                        elem_classes="generate-box-skip",
+                    )
+                    self.submit = gr.Button(
+                        "Generate", elem_id=f"{id_part}_generate", variant="primary"
+                    )
+
+                    self.skip.click(
+                        fn=lambda: shared.state.skip(),
+                        inputs=[],
+                        outputs=[],
+                    )
+
+                    self.interrupt.click(
+                        fn=lambda: shared.state.interrupt(),
+                        inputs=[],
+                        outputs=[],
+                    )
+
+                with gr.Row(elem_id=f"{id_part}_tools"):
+                    self.paste = ToolButton(value=paste_symbol, elem_id="paste")
+
+                    self.clear_prompt_button = ToolButton(
+                        value=clear_prompt_symbol, elem_id=f"{id_part}_clear_prompt"
+                    )
+                    self.restore_progress_button = ToolButton(
+                        value=restore_progress_symbol,
+                        elem_id=f"{id_part}_restore_progress",
+                        visible=False,
+                    )
+
+                    self.token_counter = gr.HTML(
+                        value="<span>0/75</span>",
+                        elem_id=f"{id_part}_token_counter",
+                        elem_classes=["token-counter"],
+                    )
+                    self.token_button = gr.Button(
+                        visible=False, elem_id=f"{id_part}_token_button"
+                    )
+                    self.negative_token_counter = gr.HTML(
+                        value="<span>0/75</span>",
+                        elem_id=f"{id_part}_negative_token_counter",
+                        elem_classes=["token-counter"],
+                    )
+                    self.negative_token_button = gr.Button(
+                        visible=False, elem_id=f"{id_part}_negative_token_button"
+                    )
+
+                    self.clear_prompt_button.click(
+                        fn=lambda *x: x,
+                        _js="confirm_clear_prompt",
+                        inputs=[self.prompt, self.negative_prompt],
+                        outputs=[self.prompt, self.negative_prompt],
+                    )
+
+                self.ui_styles = ui_prompt_styles.UiPromptStyles(
+                    id_part, self.prompt, self.negative_prompt
+                )
+
+        self.prompt_img.change(
+            fn=modules.images.image_data,
+            inputs=[self.prompt_img],
+            outputs=[self.prompt, self.prompt_img],
+            show_progress=False,
+        )
 
 
 def create_output_panel(tabname, outdir):
-    from modules import shared
-    import modules.generation_parameters_copypaste as parameters_copypaste
-
     def open_folder(f):
         if not os.path.exists(f):
-            print(f'Folder "{f}" does not exist. After you create an image, the folder will be created.')
+            print(
+                f'Folder "{f}" does not exist. After you create an image, the folder will be created.'
+            )
             return
         elif not os.path.isdir(f):
-            print(f"""
+            print(
+                f"""
 WARNING
 An open_folder request was made with an argument that is not a folder.
 This could be an error or a malicious attempt to run code on your computer.
 Requested path was: {f}
-""", file=sys.stderr)
+""",
+                file=sys.stderr,
+            )
             return
 
         if not shared.cmd_opts.hide_ui_dir_config:
@@ -112,19 +236,38 @@ Requested path was: {f}
             else:
                 sp.Popen(["xdg-open", path])
 
-    with gr.Column(variant='panel', elem_id=f"{tabname}_results"):
+    with gr.Column(variant="panel", elem_id=f"{tabname}_results"):
         with gr.Group(elem_id=f"{tabname}_gallery_container"):
-            result_gallery = gr.Gallery(label='Output', show_label=False, elem_id=f"{tabname}_gallery", columns=1, height=480)
-            result_video = gr.Video(label='Output Video', show_label=False, elem_id=f'{tabname}_video', interactive=False)
+            result_gallery = gr.Gallery(
+                label="Output",
+                show_label=False,
+                elem_id=f"{tabname}_gallery",
+                columns=4,
+                preview=True,
+                height=shared.opts.gallery_height or None,
+            )
+            result_video = gr.PlayableVideo(
+                label="Output Video", show_label=False, elem_id=f"{tabname}_video"
+            )
 
         generation_info = None
         with gr.Column():
-            with gr.Row(elem_id=f"image_buttons_{tabname}"):
-                open_folder_button = gr.Button(folder_symbol,
-                                               elem_id="hidden_element" if shared.cmd_opts.hide_ui_dir_config else f'open_folder_{tabname}')
+            with gr.Row(
+                elem_id=f"image_buttons_{tabname}", elem_classes="image-buttons"
+            ):
+                open_folder_button = ToolButton(
+                    folder_symbol,
+                    elem_id=f"{tabname}_open_folder",
+                    visible=not shared.cmd_opts.hide_ui_dir_config,
+                    tooltip="Open images output directory.",
+                )
 
-                save = gr.Button('Save', elem_id=f'save_{tabname}')
-                # save_zip = gr.Button('Zip', elem_id=f'save_zip_{tabname}')
+                if tabname != "extras":
+                    save = ToolButton(
+                        "💾",
+                        elem_id=f"save_{tabname}",
+                        tooltip=f"Save the image to a dedicated directory ({shared.opts.outdir_save}).",
+                    )
 
             open_folder_button.click(
                 fn=lambda: open_folder(shared.opts.outdir_samples or outdir),
@@ -132,21 +275,41 @@ Requested path was: {f}
                 outputs=[],
             )
 
-            with gr.Row():
-                download_files = gr.File(None, file_count="multiple", interactive=False, show_label=False,
-                                         visible=False, elem_id=f'download_files_{tabname}')
+            download_files = gr.File(
+                None,
+                file_count="multiple",
+                interactive=False,
+                show_label=False,
+                visible=False,
+                elem_id=f"download_files_{tabname}",
+            )
 
             with gr.Group():
-                html_info = gr.HTML(elem_id=f'html_info_{tabname}')
-                html_log = gr.HTML(elem_id=f'html_log_{tabname}')
+                html_info = gr.HTML(
+                    elem_id=f"html_info_{tabname}", elem_classes="infotext"
+                )
+                html_log = gr.HTML(
+                    elem_id=f"html_log_{tabname}", elem_classes="html-log"
+                )
 
-                generation_info = gr.Textbox(visible=False, elem_id=f'generation_info_{tabname}')
+                generation_info = gr.Textbox(
+                    visible=False, elem_id=f"generation_info_{tabname}"
+                )
+                if tabname == "txt2img" or tabname == "img2img" or tabname == "mov2mov":
+                    generation_info_button = gr.Button(
+                        visible=False, elem_id=f"{tabname}_generation_info_button"
+                    )
+                    generation_info_button.click(
+                        fn=update_generation_info,
+                        _js="function(x, y, z){ return [x, y, selected_gallery_index()] }",
+                        inputs=[generation_info, html_info, html_info],
+                        outputs=[html_info, html_info],
+                        show_progress=False,
+                    )
 
                 save.click(
                     fn=call_queue.wrap_gradio_call(save_video),
-                    inputs=[
-                        result_video
-                    ],
+                    inputs=[result_video],
                     outputs=[
                         download_files,
                         html_log,
@@ -154,201 +317,255 @@ Requested path was: {f}
                     show_progress=False,
                 )
 
-        return result_gallery, result_video, generation_info, html_info, html_log
+            return result_gallery, result_video, generation_info, html_info, html_log
 
 
-def create_modnet(html_id):
-    with gr.Group():
-        with gr.Accordion("ModNet", open=True):
-            background_image = gr.Image(label='Background', type='numpy', elem_id='modnet_background_image')
-            background_movie = gr.Video(label='Background', elem_id='modnet_background_movie')
-            with gr.Row():
-                gr.HTML(
-                    value='''
-                      <p>
-                        Refer to the <a href="https://github.com/DavG25/sd-webui-mov2mov/wiki/ModNet" target="_blank" style="text-decoration: underline;">mov2mov wiki</a> for more information on how to use ModNet
-                      </p>
-                    ''')
+def create_refiner():
+    with InputAccordion(
+        False, label="Refiner", elem_id=f"{id_part}_enable"
+    ) as enable_refiner:
+        with gr.Row():
+            refiner_checkpoint = gr.Dropdown(
+                label="Checkpoint",
+                elem_id=f"{id_part}_checkpoint",
+                choices=sd_models.checkpoint_tiles(),
+                value="",
+                tooltip="switch to another model in the middle of generation",
+            )
+            create_refresh_button(
+                refiner_checkpoint,
+                sd_models.list_models,
+                lambda: {"choices": sd_models.checkpoint_tiles()},
+                f"{id_part}_checkpoint_refresh",
+            )
 
-            with gr.Row():
-                enable = gr.Checkbox(label='Enable', value=False, elem_id=f"{html_id}_enable")  # 启用就是提取人物了
-
-                modnet_model = gr.Dropdown(label='Model', choices=list(modnet_models), value='none',
-                                           elem_id=f"{html_id}_modnet_model")
-
-            with gr.Row():
-                modnet_resize_mode = gr.Radio(label="Resize mode", elem_id=f"{html_id}_resize_mode",
-                                              choices=["Just resize", "Crop and resize", "Resize and fill",
-                                                       "Just resize (latent upscale)"], type="index",
-                                              value="Just resize")
-
-            with gr.Row():
-                merge_background_mode = gr.Radio(label='Background mode', elem_id=f'{html_id}_merge_background_mode',
-                                                 choices=['Clear', 'Origin', 'Green', 'Image', 'Video'],
-                                                 type='index',
-                                                 value='Clear')
-
-                merge_background_mode.change(fn=None, inputs=[merge_background_mode], outputs=[],
-                                             _js='switchModnetMode')
-
-            with gr.Row():
-                movie_frames = gr.Slider(minimum=10,
-                                         maximum=60,
-                                         step=1,
-                                         label='Movie frames',
-                                         elem_id='modnet_movie_frames',
-                                         value=30)
-
-    return [enable, background_image, background_movie, modnet_model, modnet_resize_mode, merge_background_mode,
-            movie_frames]
+            refiner_switch_at = gr.Slider(
+                value=0.8,
+                label="Switch at",
+                minimum=0.01,
+                maximum=1.0,
+                step=0.01,
+                elem_id=f"{id_part}_switch_at",
+                tooltip="fraction of sampling steps when the switch to refiner model should happen; 1=never, 0.5=switch in the middle of generation",
+            )
+    return enable_refiner, refiner_checkpoint, refiner_switch_at
 
 
 def on_ui_tabs():
-    with gr.Blocks(analytics_enabled=False) as mov2mov_tabs:
+    scripts_mov2mov.initialize_scripts(is_img2img=True)
+
+    # with gr.Blocks(analytics_enabled=False) as mov2mov_interface:
+    with gr.TabItem(
+        "mov2mov", id=f"tab_{id_part}", elem_id=f"tab_{id_part}"
+    ) as mov2mov_interface:
+        toprow = Toprow(is_img2img=False, id_part=id_part)
         dummy_component = gr.Label(visible=False)
-
-        mov2mov_prompt, mov2mov_negative_prompt, submit = create_toprow()
-
-        # create tabs
-        with FormRow(equal_height=False):
-            with gr.Column(variant='compact', elem_id=f"{html_id}_settings"):
-                with gr.Tabs(elem_id=f"mode_{html_id}"):
-                    with gr.TabItem('Input video', id='mov2mov', elem_id=f"{html_id}_mov2mov_tab") as tab_mov2mov:
-                        init_mov = gr.Video(label="Video for mov2mov", elem_id=f"{html_id}_mov", show_label=False,
-                                            source="upload")
-                        init_mov.change(None, None, None, _js="() => { refreshMov2movVideoHelper() }")
-
-                # Video dimensions helper
-                with FormRow(elem_id="mov2mov_input_video_info"):
-                    gr.Textbox(label="Input video width", elem_id="mov2mov_input_video_info_width",
-                               value="N/A", interactive=False)
-                    gr.Textbox(label="Input video height", elem_id="mov2mov_input_video_info_height",
-                               value="N/A", interactive=False)
-                    
+        with gr.Tab(
+            "Generation", id=f"{id_part}_generation"
+        ) as mov2mov_generation_tab, ResizeHandleRow(equal_height=False):
+            with gr.Column(variant="compact", elem_id="mov2mov_settings"):
+                with gr.Tabs(elem_id=f"mode_{id_part}"):
+                    init_mov = gr.Video(
+                        label="Video for mov2mov",
+                        elem_id=f"{id_part}_mov",
+                        show_label=False,
+                        source="upload",
+                    )
 
                 with FormRow():
-                    resize_mode = gr.Radio(label="Resize mode", elem_id="mov2mov_input_video_resize_mode",
-                                           choices=["Just resize", "Crop and resize", "Resize and fill",
-                                                    "Just resize (latent upscale)"], type="index", value="Just resize")
+                    resize_mode = gr.Radio(
+                        label="Resize mode",
+                        elem_id=f"{id_part}_resize_mode",
+                        choices=[
+                            "Just resize",
+                            "Crop and resize",
+                            "Resize and fill",
+                            "Just resize (latent upscale)",
+                        ],
+                        type="index",
+                        value="Just resize",
+                    )
+                scripts_mov2mov.prepare_ui()
 
                 for category in ordered_ui_categories():
                     if category == "sampler":
-                        steps, sampler = create_sampler_and_steps_selection(visible_sampler_names(), "mov2mov")
-
+                        steps, sampler_name = create_sampler_and_steps_selection(
+                            sd_samplers.visible_sampler_names(), id_part
+                        )
                     elif category == "dimensions":
                         with FormRow():
-                            with gr.Column(elem_id=f"{html_id}_column_size", scale=4):
-                                width = gr.Slider(minimum=64, maximum=2048, step=8, label="Width", value=512,
-                                                  elem_id=f"{html_id}_width")
-                                height = gr.Slider(minimum=64, maximum=2048, step=8, label="Height", value=512,
-                                                   elem_id=f"{html_id}_height")
+                            with gr.Column(elem_id=f"{id_part}_column_size", scale=4):
+                                with gr.Tabs():
+                                    with gr.Tab(
+                                        label="Resize to",
+                                        elem_id=f"{id_part}_tab_resize_to",
+                                    ) as tab_scale_to:
+                                        with FormRow():
+                                            with gr.Column(
+                                                elem_id=f"{id_part}_column_size",
+                                                scale=4,
+                                            ):
+                                                width = gr.Slider(
+                                                    minimum=64,
+                                                    maximum=2048,
+                                                    step=8,
+                                                    label="Width",
+                                                    value=512,
+                                                    elem_id=f"{id_part}_width",
+                                                )
+                                                height = gr.Slider(
+                                                    minimum=64,
+                                                    maximum=2048,
+                                                    step=8,
+                                                    label="Height",
+                                                    value=512,
+                                                    elem_id=f"{id_part}_height",
+                                                )
+                                            with gr.Column(
+                                                elem_id=f"{id_part}_dimensions_row",
+                                                scale=1,
+                                                elem_classes="dimensions-tools",
+                                            ):
+                                                res_switch_btn = ToolButton(
+                                                    value=switch_values_symbol,
+                                                    elem_id=f"{id_part}_res_switch_btn",
+                                                )
+                                                detect_image_size_btn = ToolButton(
+                                                    value=detect_image_size_symbol,
+                                                    elem_id=f"{id_part}_detect_image_size_btn",
+                                                )
+                    elif category == "denoising":
+                        denoising_strength = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            step=0.01,
+                            label="Denoising strength",
+                            value=0.75,
+                            elem_id=f"{id_part}_denoising_strength",
+                        )
 
-                            res_switch_btn = ToolButton(value=switch_values_symbol, elem_id=f"{html_id}_res_switch_btn")
-                            with gr.Column(elem_id=f"{html_id}_column_batch"):
-                                generate_mov_mode = gr.Radio(label="Video codec", elem_id="movie_codec",
-                                                              choices=["MP4V", "H.264", "XVID", ], type="index",
-                                                              value="H.264")
-
-                                noise_multiplier = gr.Slider(minimum=0,
-                                                              maximum=1.5,
-                                                              step=0.01,
-                                                              label='Noise multiplier',
-                                                              elem_id=f'{html_id}_noise_multiplier',
-                                                              value=0)
-
-                                    # color_correction = gr.Checkbox(
-                                    #     value=False,
-                                    #     elem_id=f'{html_id}_color_correction',
-                                    #     label='Color correction')
+                        noise_multiplier = gr.Slider(
+                            minimum=0,
+                            maximum=1.5,
+                            step=0.01,
+                            label="Noise multiplier",
+                            elem_id=f"{id_part}_noise_multiplier",
+                            value=1,
+                        )
+                        with gr.Row(elem_id=f"{id_part}_frames_setting"):
+                            movie_frames = gr.Slider(
+                                minimum=10,
+                                maximum=60,
+                                step=1,
+                                label="Movie FPS",
+                                elem_id=f"{id_part}_movie_frames",
+                                value=30,
+                            )
+                            max_frames = gr.Number(
+                                label="Max FPS",
+                                value=-1,
+                                elem_id=f"{id_part}_max_frames",
+                            )
 
                     elif category == "cfg":
-                        with FormGroup():
-                            with FormRow():
-                                cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='CFG Scale', value=7.0,
-                                                      elem_id=f"{html_id}_cfg_scale")
-                                image_cfg_scale = gr.Slider(minimum=0, maximum=3.0, step=0.05, label='Image CFG Scale',
-                                                            value=1.5, elem_id=f"{html_id}_image_cfg_scale",
-                                                            visible=shared.sd_model and shared.sd_model.cond_stage_key == "edit")
-                            denoising_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01,
-                                                           label='Denoising strength', value=0.75,
-                                                           elem_id=f"{html_id}_denoising_strength")
-                            movie_frames = gr.Slider(minimum=10,
-                                                     maximum=60,
-                                                     step=1,
-                                                     label='Video frames',
-                                                     elem_id=f'{html_id}_movie_frames',
-                                                     value=30)
-
-                    elif category == "seed":
-                        max_frames = gr.Number(label='Max frames', value=-1, elem_id=f'{html_id}_max_frames')
-                    #    seed, reuse_seed, subseed, reuse_subseed, subseed_strength, seed_resize_from_h, seed_resize_from_w, seed_checkbox = create_seed_inputs(
-                    #        'mov2mov')
-
-                    #    seed.style(container=False)
+                        with gr.Row():
+                            cfg_scale = gr.Slider(
+                                minimum=1.0,
+                                maximum=30.0,
+                                step=0.5,
+                                label="CFG Scale",
+                                value=7.0,
+                                elem_id=f"{id_part}_cfg_scale",
+                            )
+                            image_cfg_scale = gr.Slider(
+                                minimum=0,
+                                maximum=3.0,
+                                step=0.05,
+                                label="Image CFG Scale",
+                                value=1.5,
+                                elem_id=f"{id_part}_image_cfg_scale",
+                                visible=False,
+                            )
 
                     elif category == "checkboxes":
-                        with FormRow(elem_id=f"{html_id}_checkboxes", variant="compact"):
-                            restore_faces = gr.Checkbox(label='Restore faces', value=False,
-                                                        visible=len(shared.face_restorers) > 1,
-                                                        elem_id=f"{html_id}_restore_faces")
-                            tiling = gr.Checkbox(label='Tiling', value=False, elem_id=f"{html_id}_tiling")
+                        with FormRow(elem_classes="checkboxes-row", variant="compact"):
+                            pass
 
-
-
-
+                    elif category == "accordions":
+                        with gr.Row(
+                            elem_id=f"{id_part}_accordions", elem_classes="accordions"
+                        ):
+                            scripts_mov2mov.setup_ui_for_section(category)
 
                     elif category == "override_settings":
-                        with FormRow(elem_id=f"{html_id}_override_settings_row") as row:
-                            override_settings = create_override_settings_dropdown('mov2mov', row)
+                        with FormRow(elem_id=f"{id_part}_override_settings_row") as row:
+                            override_settings = create_override_settings_dropdown(
+                                "mov2mov", row
+                            )
 
                     elif category == "scripts":
-                        with FormGroup(elem_id=f"{html_id}_script_container"):
-                            modnet_enable, modnet_background_image, modnet_background_movie, modnet_model, modnet_resize_mode, modnet_merge_background_mode, modnet_movie_frames = create_modnet(
-                                'modnet')
+                        editor = MovieEditor(id_part, init_mov, movie_frames)
+                        editor.render()
+                        with FormGroup(elem_id=f"{id_part}_script_container"):
+                            custom_inputs = scripts_mov2mov.setup_ui()
 
-                            custom_inputs = scripts.scripts_img2img.setup_ui()
+                    if category not in {"accordions"}:
+                        scripts_mov2mov.setup_ui_for_section(category)
 
-            mov2mov_gallery, result_video, generation_info, html_info, html_log = create_output_panel("mov2mov",
-                                                                                                      shared.opts.data.get(
-                                                                                                          "mov2mov_output_dir",
-                                                                                                          mov2mov_output_dir))
+            (
+                mov2mov_gallery,
+                result_video,
+                generation_info,
+                html_info,
+                html_log,
+            ) = create_output_panel(id_part, opts.mov2mov_output_dir)
+
+            res_switch_btn.click(
+                fn=None,
+                _js="function(){switchWidthHeight('mov2mov')}",
+                inputs=None,
+                outputs=None,
+                show_progress=False,
+            )
+
+            # calc video size
+            detect_image_size_btn.click(
+                fn=calc_video_w_h,
+                inputs=[init_mov, width, height],
+                outputs=[width, height],
+            )
 
             mov2mov_args = dict(
-                fn=wrap_gradio_gpu_call(mov2mov.mov2mov, extra_outputs=[None, '', '']),
+                fn=wrap_gradio_gpu_call(mov2mov.mov2mov, extra_outputs=[None, "", ""]),
                 _js="submit_mov2mov",
                 inputs=[
-                           dummy_component,
-                           # dummy_component, # mode
-                           mov2mov_prompt,
-                           mov2mov_negative_prompt,
-                           init_mov,
-                           steps,
-                           sampler,
-                           restore_faces,
-                           tiling,
-                           # extract_characters,
-                           # merge_background,
-                           # modnet_model,
-                           modnet_enable, modnet_background_image, modnet_background_movie, modnet_model,
-                           modnet_resize_mode, modnet_merge_background_mode, modnet_movie_frames,
-
-                           generate_mov_mode,
-                           noise_multiplier,
-                           # color_correction,
-                           cfg_scale,
-                           image_cfg_scale,
-                           denoising_strength,
-                           movie_frames,
-                           max_frames,
-                           # seed,
-                           # subseed, subseed_strength, seed_resize_from_h, seed_resize_from_w, seed_checkbox,
-                           height,
-                           width,
-                           resize_mode,
-                           override_settings,
-                       ] + custom_inputs,
+                    dummy_component,
+                    toprow.prompt,
+                    toprow.negative_prompt,
+                    toprow.ui_styles.dropdown,
+                    init_mov,
+                    steps,
+                    sampler_name,
+                    cfg_scale,
+                    image_cfg_scale,
+                    denoising_strength,
+                    height,
+                    width,
+                    resize_mode,
+                    override_settings,
+                    # refiner
+                    # enable_refiner, refiner_checkpoint, refiner_switch_at,
+                    # mov2mov params
+                    noise_multiplier,
+                    movie_frames,
+                    max_frames,
+                    # editor
+                    editor.gr_enable_movie_editor,
+                    editor.gr_df,
+                    editor.gr_eb_weight,
+                ]
+                + custom_inputs,
                 outputs=[
-                    mov2mov_gallery,
                     result_video,
                     generation_info,
                     html_info,
@@ -356,19 +573,60 @@ def on_ui_tabs():
                 ],
                 show_progress=False,
             )
-            submit.click(**mov2mov_args)
 
-    return [(mov2mov_tabs, "mov2mov", f"{html_id}_tabs")]
+            toprow.submit.click(**mov2mov_args)
+
+    return [(mov2mov_interface, "mov2mov", f"{id_part}_tabs")]
 
 
-# 注册设置页的配置项
+def calc_video_w_h(video, width, height):
+    if not video:
+        return width, height
+
+    return m2m_util.calc_video_w_h(video)
+
+
 def on_ui_settings():
-    section = ('mov2mov', "Mov2Mov")
-    shared.opts.add_option("mov2mov_outpath_samples", shared.OptionInfo(
-        mov2mov_outpath_samples, "Mov2Mov output path for image", section=section))  # 图片保存路径
-    shared.opts.add_option("mov2mov_output_dir", shared.OptionInfo(
-        mov2mov_output_dir, "Mov2Mov output path for video", section=section))  # 视频保存路径
+    section = ("mov2mov", "Mov2Mov")
+    shared.opts.add_option(
+        "mov2mov_outpath_samples",
+        shared.OptionInfo(
+            mov2mov_outpath_samples, "Mov2Mov output path for image", section=section
+        ),
+    )
+    shared.opts.add_option(
+        "mov2mov_output_dir",
+        shared.OptionInfo(
+            mov2mov_output_dir, "Mov2Mov output path for video", section=section
+        ),
+    )
 
 
-script_callbacks.on_ui_settings(on_ui_settings)  # 注册进设置页
-script_callbacks.on_ui_tabs(on_ui_tabs)
+img2img_toprow: gr.Row = None
+
+
+def block_context_init(self, *args, **kwargs):
+    origin_block_context_init(self, *args, **kwargs)
+
+    if self.elem_id == "tab_img2img":
+        self.parent.__enter__()
+        on_ui_tabs()
+        self.parent.__exit__()
+
+
+def on_app_reload():
+    global origin_block_context_init
+    if origin_block_context_init:
+        patches.undo(__name__, obj=gr.blocks.BlockContext, field="__init__")
+        origin_block_context_init = None
+
+
+origin_block_context_init = patches.patch(
+    __name__,
+    obj=gr.blocks.BlockContext,
+    field="__init__",
+    replacement=block_context_init,
+)
+script_callbacks.on_before_reload(on_app_reload)
+script_callbacks.on_ui_settings(on_ui_settings)
+# script_callbacks.on_ui_tabs(on_ui_tabs)
